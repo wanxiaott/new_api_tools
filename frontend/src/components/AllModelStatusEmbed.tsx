@@ -31,15 +31,18 @@ interface ModelStatus {
   success_rate: number
   current_status: 'green' | 'yellow' | 'red'
   slot_data: SlotStatus[]
+  channel_count?: number
+}
+
+interface GroupModel {
+  model_name: string
+  channel_count: number
+  request_count_24h: number
 }
 
 interface ModelGroup {
   group_name: string
-  models: Array<{
-    model_name: string
-    channel_count: number
-    request_count_24h: number
-  }>
+  models: GroupModel[]
   model_count: number
   active_model_count: number
   channel_count: number
@@ -56,6 +59,13 @@ const TIME_WINDOWS = [
   { value: '12h', label: '12小时' },
   { value: '24h', label: '24小时' },
 ]
+
+const TIME_WINDOW_CONFIG: Record<string, { totalSeconds: number; slots: number }> = {
+  '1h': { totalSeconds: 3600, slots: 60 },
+  '6h': { totalSeconds: 21600, slots: 24 },
+  '12h': { totalSeconds: 43200, slots: 24 },
+  '24h': { totalSeconds: 86400, slots: 24 },
+}
 
 const ALL_GROUP = '__all__'
 
@@ -118,6 +128,36 @@ function getAggregateRate(models: ModelStatus[]): number {
   return Math.round((success / total) * 10000) / 100
 }
 
+function createEmptyModelStatus(modelName: string, timeWindow: string, meta?: GroupModel): ModelStatus {
+  const config = TIME_WINDOW_CONFIG[timeWindow] || TIME_WINDOW_CONFIG['24h']
+  const now = Math.floor(Date.now() / 1000)
+  const slotSeconds = Math.floor(config.totalSeconds / config.slots)
+  const startTime = now - config.totalSeconds
+
+  return {
+    model_name: modelName,
+    display_name: modelName,
+    time_window: timeWindow,
+    total_requests: 0,
+    success_count: 0,
+    success_rate: 100,
+    current_status: 'green',
+    channel_count: meta?.channel_count,
+    slot_data: Array.from({ length: config.slots }, (_, slot) => {
+      const slotStart = startTime + slot * slotSeconds
+      return {
+        slot,
+        start_time: slotStart,
+        end_time: slotStart + slotSeconds,
+        total_requests: 0,
+        success_count: 0,
+        success_rate: 100,
+        status: 'green',
+      }
+    }),
+  }
+}
+
 export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 60 }: AllModelStatusEmbedProps) {
   const [groups, setGroups] = useState<ModelGroup[]>([])
   const [models, setModels] = useState<ModelStatus[]>([])
@@ -141,7 +181,31 @@ export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 
     return map
   }, [models])
 
-  const allModelNames = useMemo(() => models.map(model => model.model_name), [models])
+  const groupModelMeta = useMemo(() => {
+    const map = new Map<string, GroupModel>()
+    for (const group of groups) {
+      for (const model of group.models) {
+        const current = map.get(model.model_name)
+        if (!current || model.request_count_24h > current.request_count_24h) {
+          map.set(model.model_name, model)
+        }
+      }
+    }
+    return map
+  }, [groups])
+
+  const allModelNames = useMemo(() => {
+    const names = new Set<string>()
+    for (const group of groups) {
+      for (const model of group.models) {
+        names.add(model.model_name)
+      }
+    }
+    for (const model of models) {
+      names.add(model.model_name)
+    }
+    return Array.from(names)
+  }, [groups, models])
 
   const activeGroupInfo = useMemo(() => {
     if (activeGroup === ALL_GROUP) return null
@@ -150,19 +214,25 @@ export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 
 
   const activeModels = useMemo(() => {
     const names = activeGroupInfo
-      ? activeGroupInfo.models.map(model => model.model_name)
+      ? Array.from(new Set(activeGroupInfo.models.map(model => model.model_name)))
       : allModelNames
     const q = query.trim().toLowerCase()
 
     return names
-      .map(name => modelMap.get(name))
-      .filter((model): model is ModelStatus => Boolean(model))
+      .map(name => {
+        const meta = groupModelMeta.get(name)
+        const model = modelMap.get(name)
+        if (model) {
+          return meta ? { ...model, channel_count: meta.channel_count } : model
+        }
+        return createEmptyModelStatus(name, timeWindow, meta)
+      })
       .filter(model => !q || model.model_name.toLowerCase().includes(q))
       .sort((a, b) => {
         if (b.total_requests !== a.total_requests) return b.total_requests - a.total_requests
         return a.model_name.localeCompare(b.model_name)
       })
-  }, [activeGroupInfo, allModelNames, modelMap, query])
+  }, [activeGroupInfo, allModelNames, groupModelMeta, modelMap, query, timeWindow])
 
   const aggregateStatus = getAggregateStatus(activeModels)
   const aggregateRate = getAggregateRate(activeModels)
@@ -338,7 +408,7 @@ export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 
               <GroupTab
                 active={activeGroup === ALL_GROUP}
                 name="全部"
-                modelCount={models.length}
+                modelCount={allModelNames.length}
                 requestCount={models.reduce((sum, model) => sum + model.total_requests, 0)}
                 onClick={() => setActiveGroup(ALL_GROUP)}
               />
@@ -451,13 +521,14 @@ function ModelStatusRow({ model }: { model: ModelStatus }) {
             </h2>
           </div>
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-            <span>{statusLabel(model.current_status)}</span>
+            <span>{model.total_requests > 0 ? statusLabel(model.current_status) : '无请求'}</span>
+            {model.channel_count !== undefined && <span>{model.channel_count} 个渠道</span>}
             <span>成功率 {model.success_rate}%</span>
             <span>{formatNumber(model.total_requests)} 次请求</span>
           </div>
         </div>
         <span className={cn("shrink-0 rounded-full border px-2 py-0.5 text-xs font-medium", statusClass(model.current_status))}>
-          {model.success_rate}%
+          {model.total_requests > 0 ? `${model.success_rate}%` : '无请求'}
         </span>
       </div>
 
