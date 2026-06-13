@@ -424,30 +424,167 @@ func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window
 func (s *ModelStatusService) GetAllModelsStatus(window string) ([]map[string]interface{}, error) {
 	twConfig, ok := timeWindowConfigs[window]
 	if !ok {
-		twConfig = timeWindowConfigs[DefaultTimeWindow]
+		window = DefaultTimeWindow
+		twConfig = timeWindowConfigs[window]
 	}
 
-	startTime := time.Now().Unix() - twConfig.totalSeconds
-	query := s.db.RebindQuery(`
-		SELECT model_name, COUNT(*) AS request_count
-		FROM logs
-		WHERE type IN (2, 5) AND model_name != '' AND created_at >= ?
-		GROUP BY model_name
-		ORDER BY request_count DESC`)
+	cacheKey := fmt.Sprintf("model_status:all:%s", window)
+	cm := cache.Get()
+	var cached []map[string]interface{}
+	found, _ := cm.GetJSON(cacheKey, &cached)
+	if found {
+		return cached, nil
+	}
 
-	models, err := s.db.Query(query, startTime)
+	now := time.Now().Unix()
+	startTime := now - twConfig.totalSeconds
+	numSlots := twConfig.numSlots
+	slotSeconds := twConfig.slotSeconds
+
+	query := s.db.RebindQuery(fmt.Sprintf(`
+		SELECT model_name,
+			FLOOR((created_at - %d) / %d) AS slot_idx,
+			COUNT(*) AS total,
+			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) AS success,
+			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) AS failure,
+			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) AS empty_count
+		FROM logs
+		WHERE model_name != ''
+			AND created_at >= ? AND created_at < ?
+			AND type IN (2, 5)
+		GROUP BY model_name, FLOOR((created_at - %d) / %d)`,
+		startTime, slotSeconds,
+		startTime, slotSeconds))
+
+	rows, err := s.db.Query(query, startTime, now)
 	if err != nil {
 		return nil, err
 	}
 
-	names := make([]string, 0, len(models))
-	for _, m := range models {
-		if name, ok := m["model_name"].(string); ok {
-			names = append(names, name)
-		}
+	type slotInfo struct {
+		total   int64
+		success int64
+		failure int64
+		empty   int64
+	}
+	type modelAgg struct {
+		name    string
+		slots   map[int64]*slotInfo
+		total   int64
+		success int64
+		failure int64
+		empty   int64
 	}
 
-	return s.GetMultipleModelsStatus(names, window)
+	models := make(map[string]*modelAgg)
+	for _, row := range rows {
+		modelName := toString(row["model_name"])
+		if modelName == "" {
+			continue
+		}
+		idx := toInt64(row["slot_idx"])
+		if idx < 0 || idx >= int64(numSlots) {
+			continue
+		}
+
+		total := toInt64(row["total"])
+		success := toInt64(row["success"])
+		failure := toInt64(row["failure"])
+		empty := toInt64(row["empty_count"])
+
+		agg := models[modelName]
+		if agg == nil {
+			agg = &modelAgg{
+				name:  modelName,
+				slots: make(map[int64]*slotInfo, numSlots),
+			}
+			models[modelName] = agg
+		}
+
+		agg.slots[idx] = &slotInfo{
+			total:   total,
+			success: success,
+			failure: failure,
+			empty:   empty,
+		}
+		agg.total += total
+		agg.success += success
+		agg.failure += failure
+		agg.empty += empty
+	}
+
+	names := make([]string, 0, len(models))
+	for name := range models {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		left := models[names[i]]
+		right := models[names[j]]
+		if left.total != right.total {
+			return left.total > right.total
+		}
+		return left.name < right.name
+	})
+
+	results := make([]map[string]interface{}, 0, len(names))
+	for _, name := range names {
+		agg := models[name]
+		slotData := make([]map[string]interface{}, 0, numSlots)
+		for i := 0; i < numSlots; i++ {
+			slotStart := startTime + int64(i)*slotSeconds
+			slotEnd := slotStart + slotSeconds
+
+			si := agg.slots[int64(i)]
+			slotTotal := int64(0)
+			slotSuccess := int64(0)
+			slotFailure := int64(0)
+			slotEmpty := int64(0)
+			if si != nil {
+				slotTotal = si.total
+				slotSuccess = si.success
+				slotFailure = si.failure
+				slotEmpty = si.empty
+			}
+
+			slotRate := float64(100)
+			if slotTotal > 0 {
+				slotRate = float64(slotSuccess) / float64(slotTotal) * 100
+			}
+
+			slotData = append(slotData, map[string]interface{}{
+				"slot":           i,
+				"start_time":     slotStart,
+				"end_time":       slotEnd,
+				"total_requests": slotTotal,
+				"success_count":  slotSuccess,
+				"failure_count":  slotFailure,
+				"empty_count":    slotEmpty,
+				"success_rate":   roundRate(slotRate),
+				"status":         getStatusColor(slotRate, slotTotal),
+			})
+		}
+
+		overallRate := float64(100)
+		if agg.total > 0 {
+			overallRate = float64(agg.success) / float64(agg.total) * 100
+		}
+
+		results = append(results, map[string]interface{}{
+			"model_name":     agg.name,
+			"display_name":   agg.name,
+			"time_window":    window,
+			"total_requests": agg.total,
+			"success_count":  agg.success,
+			"failure_count":  agg.failure,
+			"empty_count":    agg.empty,
+			"success_rate":   roundRate(overallRate),
+			"current_status": getStatusColor(overallRate, agg.total),
+			"slot_data":      slotData,
+		})
+	}
+
+	cm.Set(cacheKey, results, 30*time.Second)
+	return results, nil
 }
 
 // GetTokenGroups 返回令牌分组列表及其关联的模型（基于 abilities 表）
