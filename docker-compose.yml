@@ -10,7 +10,7 @@
 
 services:
   newapi-tools:
-    image: ghcr.io/james-6-23/new_api_tools:latest
+    image: ghcr.io/wanxiaott/new_api_tools:latest
     container_name: newapi-tools
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：
