@@ -37,7 +37,8 @@ interface ModelStatus {
 interface GroupModel {
   model_name: string
   channel_count: number
-  request_count_24h: number
+  request_count: number
+  request_count_24h?: number
 }
 
 interface ModelGroup {
@@ -46,6 +47,7 @@ interface ModelGroup {
   model_count: number
   active_model_count: number
   channel_count: number
+  request_count: number
   request_count_24h: number
 }
 
@@ -186,7 +188,9 @@ export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 
     for (const group of groups) {
       for (const model of group.models) {
         const current = map.get(model.model_name)
-        if (!current || model.request_count_24h > current.request_count_24h) {
+        const requestCount = model.request_count ?? model.request_count_24h ?? 0
+        const currentCount = current?.request_count ?? current?.request_count_24h ?? 0
+        if (!current || requestCount > currentCount) {
           map.set(model.model_name, model)
         }
       }
@@ -261,7 +265,7 @@ export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 
 
     try {
       const [groupsResponse, statusResponse] = await Promise.all([
-        fetch(`${apiUrl}/api/model-status/embed/groups`),
+        fetch(`${apiUrl}/api/model-status/embed/groups?window=${timeWindow}`),
         fetch(`${apiUrl}/api/model-status/embed/status/all?window=${timeWindow}`),
       ])
       const [groupsData, statusData] = await Promise.all([
@@ -418,7 +422,7 @@ export function AllModelStatusEmbed({ refreshInterval: defaultRefreshInterval = 
                   active={activeGroup === group.group_name}
                   name={group.group_name}
                   modelCount={group.model_count}
-                  requestCount={group.request_count_24h}
+                  requestCount={group.request_count}
                   onClick={() => setActiveGroup(group.group_name)}
                 />
               ))}

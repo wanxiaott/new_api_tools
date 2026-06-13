@@ -106,13 +106,18 @@ func GetAvailableModels(c *gin.Context) {
 
 // GET /groups
 func GetModelGroups(c *gin.Context) {
+	window := c.DefaultQuery("window", service.DefaultTimeWindow)
 	svc := service.NewModelStatusService()
-	data, err := svc.GetModelGroups()
+	data, err := svc.GetModelGroups(window)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusOK, gin.H{
+		"success":     true,
+		"data":        data,
+		"time_window": window,
+	})
 }
 
 // GET /status/:model_name

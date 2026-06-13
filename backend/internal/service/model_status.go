@@ -102,10 +102,15 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 }
 
 // GetModelGroups returns every enabled model grouped by the NewAPI ability group.
-func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) {
+func (s *ModelStatusService) GetModelGroups(window string) ([]map[string]interface{}, error) {
+	if _, ok := timeWindowConfigs[window]; !ok {
+		window = DefaultTimeWindow
+	}
+
 	cm := cache.Get()
+	cacheKey := fmt.Sprintf("model_status:groups:%s", window)
 	var cached []map[string]interface{}
-	found, _ := cm.GetJSON("model_status:groups", &cached)
+	found, _ := cm.GetJSON(cacheKey, &cached)
 	if found {
 		return cached, nil
 	}
@@ -132,11 +137,11 @@ func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) 
 		return nil, err
 	}
 
-	startTime := time.Now().Unix() - 86400
+	startTime := time.Now().Unix() - timeWindowConfigs[window].totalSeconds
 	requestQuery := s.db.RebindQuery(fmt.Sprintf(`
 		SELECT %s AS group_name,
 			model_name,
-			COUNT(*) AS request_count_24h
+			COUNT(*) AS request_count
 		FROM logs
 		WHERE type IN (2, 5)
 			AND model_name != ''
@@ -158,7 +163,7 @@ func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) 
 		if modelName == "" {
 			continue
 		}
-		requestCounts[groupName+"\x00"+modelName] = toInt64(row["request_count_24h"])
+		requestCounts[groupName+"\x00"+modelName] = toInt64(row["request_count"])
 	}
 
 	type groupInfo struct {
@@ -195,6 +200,7 @@ func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) 
 			info.models[modelName] = map[string]interface{}{
 				"model_name":        modelName,
 				"channel_count":     channelCount,
+				"request_count":     requests,
 				"request_count_24h": requests,
 			}
 			info.channelCount += channelCount
@@ -231,8 +237,8 @@ func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) 
 		sort.Slice(modelNames, func(i, j int) bool {
 			left := info.models[modelNames[i]]
 			right := info.models[modelNames[j]]
-			leftRequests := toInt64(left["request_count_24h"])
-			rightRequests := toInt64(right["request_count_24h"])
+			leftRequests := toInt64(left["request_count"])
+			rightRequests := toInt64(right["request_count"])
 			if leftRequests != rightRequests {
 				return leftRequests > rightRequests
 			}
@@ -250,11 +256,13 @@ func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) 
 			"model_count":        len(models),
 			"active_model_count": info.activeModels,
 			"channel_count":      info.channelCount,
+			"request_count":      info.requests24h,
 			"request_count_24h":  info.requests24h,
+			"time_window":        window,
 		})
 	}
 
-	cm.Set("model_status:groups", result, 5*time.Minute)
+	cm.Set(cacheKey, result, 5*time.Minute)
 	return result, nil
 }
 
@@ -409,9 +417,22 @@ func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window
 	return results, nil
 }
 
-// GetAllModelsStatus returns status for all models that have requests
+// GetAllModelsStatus returns status for all models that have requests in the selected window.
 func (s *ModelStatusService) GetAllModelsStatus(window string) ([]map[string]interface{}, error) {
-	models, err := s.GetAvailableModels()
+	twConfig, ok := timeWindowConfigs[window]
+	if !ok {
+		twConfig = timeWindowConfigs[DefaultTimeWindow]
+	}
+
+	startTime := time.Now().Unix() - twConfig.totalSeconds
+	query := s.db.RebindQuery(`
+		SELECT model_name, COUNT(*) AS request_count
+		FROM logs
+		WHERE type IN (2, 5) AND model_name != '' AND created_at >= ?
+		GROUP BY model_name
+		ORDER BY request_count DESC`)
+
+	models, err := s.db.Query(query, startTime)
 	if err != nil {
 		return nil, err
 	}
