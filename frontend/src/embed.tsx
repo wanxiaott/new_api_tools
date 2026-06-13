@@ -1,6 +1,6 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { ModelStatusEmbed } from './components/ModelStatusEmbed'
+import { AllModelStatusEmbed } from './components/AllModelStatusEmbed'
 import './index.css'
 
 // Parse URL parameters
@@ -9,6 +9,6 @@ const refreshInterval = parseInt(urlParams.get('refresh') || '60', 10)
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <ModelStatusEmbed refreshInterval={refreshInterval} />
+    <AllModelStatusEmbed refreshInterval={refreshInterval} />
   </React.StrictMode>,
 )

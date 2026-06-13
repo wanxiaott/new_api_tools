@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
@@ -14,7 +15,7 @@ import (
 var (
 	AvailableTimeWindows = []string{"1h", "6h", "12h", "24h"}
 	DefaultTimeWindow    = "24h"
-	AvailableThemes = []string{
+	AvailableThemes      = []string{
 		"daylight", "obsidian", "minimal", "neon", "forest", "ocean", "terminal",
 		"cupertino", "material", "openai", "anthropic", "vercel", "linear",
 		"stripe", "github", "discord", "tesla",
@@ -98,6 +99,163 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 
 	cm.Set("model_status:available_models", rows, 5*time.Minute)
 	return rows, nil
+}
+
+// GetModelGroups returns every enabled model grouped by the NewAPI ability group.
+func (s *ModelStatusService) GetModelGroups() ([]map[string]interface{}, error) {
+	cm := cache.Get()
+	var cached []map[string]interface{}
+	found, _ := cm.GetJSON("model_status:groups", &cached)
+	if found {
+		return cached, nil
+	}
+
+	groupExpr := "COALESCE(NULLIF(a.`group`, ''), 'default')"
+	logGroupExpr := "COALESCE(NULLIF(`group`, ''), 'default')"
+	if s.db.IsPG {
+		groupExpr = `COALESCE(NULLIF(a."group", ''), 'default')`
+		logGroupExpr = `COALESCE(NULLIF("group", ''), 'default')`
+	}
+
+	abilityQuery := fmt.Sprintf(`
+		SELECT %s AS group_name,
+			a.model AS model_name,
+			COUNT(DISTINCT a.channel_id) AS channel_count
+		FROM abilities a
+		INNER JOIN channels c ON c.id = a.channel_id AND c.status = 1
+		WHERE a.enabled = 1 AND a.model != ''
+		GROUP BY group_name, a.model
+		ORDER BY group_name ASC, a.model ASC`, groupExpr)
+
+	abilityRows, err := s.db.Query(abilityQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	startTime := time.Now().Unix() - 86400
+	requestQuery := s.db.RebindQuery(fmt.Sprintf(`
+		SELECT %s AS group_name,
+			model_name,
+			COUNT(*) AS request_count_24h
+		FROM logs
+		WHERE type IN (2, 5)
+			AND model_name != ''
+			AND created_at >= ?
+		GROUP BY group_name, model_name`, logGroupExpr))
+
+	requestRows, err := s.db.Query(requestQuery, startTime)
+	if err != nil {
+		return nil, err
+	}
+
+	requestCounts := make(map[string]int64, len(requestRows))
+	for _, row := range requestRows {
+		groupName := toString(row["group_name"])
+		modelName := toString(row["model_name"])
+		if groupName == "" {
+			groupName = "default"
+		}
+		if modelName == "" {
+			continue
+		}
+		requestCounts[groupName+"\x00"+modelName] = toInt64(row["request_count_24h"])
+	}
+
+	type groupInfo struct {
+		name         string
+		models       map[string]map[string]interface{}
+		channelCount int64
+		requests24h  int64
+		activeModels int64
+	}
+
+	groups := make(map[string]*groupInfo)
+	for _, row := range abilityRows {
+		groupName := toString(row["group_name"])
+		modelName := toString(row["model_name"])
+		if groupName == "" {
+			groupName = "default"
+		}
+		if modelName == "" {
+			continue
+		}
+
+		info := groups[groupName]
+		if info == nil {
+			info = &groupInfo{
+				name:   groupName,
+				models: make(map[string]map[string]interface{}),
+			}
+			groups[groupName] = info
+		}
+
+		requests := requestCounts[groupName+"\x00"+modelName]
+		channelCount := toInt64(row["channel_count"])
+		if _, exists := info.models[modelName]; !exists {
+			info.models[modelName] = map[string]interface{}{
+				"model_name":        modelName,
+				"channel_count":     channelCount,
+				"request_count_24h": requests,
+			}
+			info.channelCount += channelCount
+			info.requests24h += requests
+			if requests > 0 {
+				info.activeModels++
+			}
+		}
+	}
+
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		left := groups[names[i]]
+		right := groups[names[j]]
+		if left.requests24h != right.requests24h {
+			return left.requests24h > right.requests24h
+		}
+		if len(left.models) != len(right.models) {
+			return len(left.models) > len(right.models)
+		}
+		return left.name < right.name
+	})
+
+	result := make([]map[string]interface{}, 0, len(names))
+	for _, name := range names {
+		info := groups[name]
+		modelNames := make([]string, 0, len(info.models))
+		for modelName := range info.models {
+			modelNames = append(modelNames, modelName)
+		}
+		sort.Slice(modelNames, func(i, j int) bool {
+			left := info.models[modelNames[i]]
+			right := info.models[modelNames[j]]
+			leftRequests := toInt64(left["request_count_24h"])
+			rightRequests := toInt64(right["request_count_24h"])
+			if leftRequests != rightRequests {
+				return leftRequests > rightRequests
+			}
+			return modelNames[i] < modelNames[j]
+		})
+
+		models := make([]map[string]interface{}, 0, len(modelNames))
+		for _, modelName := range modelNames {
+			models = append(models, info.models[modelName])
+		}
+
+		result = append(result, map[string]interface{}{
+			"group_name":         info.name,
+			"models":             models,
+			"model_count":        len(models),
+			"active_model_count": info.activeModels,
+			"channel_count":      info.channelCount,
+			"request_count_24h":  info.requests24h,
+		})
+	}
+
+	cm.Set("model_status:groups", result, 5*time.Minute)
+	return result, nil
 }
 
 // GetModelStatus returns status for a specific model
