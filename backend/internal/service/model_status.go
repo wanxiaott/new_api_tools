@@ -301,7 +301,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			COUNT(*) as total,
 			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
 			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty
+			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
 		FROM logs
 		WHERE model_name = ?
 			AND created_at >= ? AND created_at < ?
@@ -310,7 +310,10 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		startTime, slotSeconds,
 		startTime, slotSeconds))
 
-	rows, _ := s.db.Query(slotQuery, modelName, startTime, now)
+	rows, err := s.db.Query(slotQuery, modelName, startTime, now)
+	if err != nil {
+		return nil, err
+	}
 
 	// Initialize all slots with zeros
 	type slotInfo struct {
@@ -330,7 +333,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 					total:   toInt64(row["total"]),
 					success: toInt64(row["success"]),
 					failure: toInt64(row["failure"]),
-					empty:   toInt64(row["empty"]),
+					empty:   toInt64(row["empty_count"]),
 				}
 			}
 		}
